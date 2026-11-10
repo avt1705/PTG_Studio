@@ -30,7 +30,6 @@ WIDTH = 1920
 HEIGHT = 1080
 
 FPS = 30
-
 VIDEO_BITRATE = "4000k"
 
 ASSET_DIR = "/app"
@@ -40,6 +39,17 @@ AVATAR_HEIGHT = 900
 
 AUDIO_SAMPLE_RATE = 8000
 AUDIO_CHUNK_SECONDS = 0.05
+
+# Animation controls
+POSE_ANALYSIS_INTERVAL = 0.10
+MIN_POSE_DURATION = 0.45
+VOLUME_SMOOTHING_SECONDS = 0.30
+
+WIDE_MOUTH_MULTIPLIER = 3.0
+
+# Gesture controls
+GESTURE_INTERVAL = 20.0
+GESTURE_DURATION = 1.2
 
 
 # =====================================================
@@ -55,12 +65,166 @@ CHARACTER_FILES = {
 
 
 # =====================================================
+# FONT LOADING
+# =====================================================
+
+def find_font(font_names):
+
+    search_directories = [
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/truetype/liberation",
+        "/usr/share/fonts"
+    ]
+
+    for directory in search_directories:
+
+        for font_name in font_names:
+
+            path = os.path.join(
+                directory,
+                font_name
+            )
+
+            if os.path.exists(path):
+                return path
+
+    return None
+
+
+def load_hindi_font(size):
+
+    font_path = find_font([
+        "NotoSansDevanagari-Regular.ttf",
+        "NotoSansDevanagariUI-Regular.ttf"
+    ])
+
+    if font_path:
+
+        return ImageFont.truetype(
+            font_path,
+            size
+        )
+
+    raise FileNotFoundError(
+        "Hindi font not found. Install fonts-noto-core in Docker."
+    )
+
+
+def load_english_font(size):
+
+    font_path = find_font([
+        "DejaVuSans.ttf",
+        "LiberationSans-Regular.ttf"
+    ])
+
+    if font_path:
+
+        return ImageFont.truetype(
+            font_path,
+            size
+        )
+
+    return ImageFont.load_default()
+
+
+TITLE_FONT = load_hindi_font(48)
+SCRIPT_FONT = load_hindi_font(46)
+
+BRANDING_FONT = load_english_font(25)
+
+
+# =====================================================
+# NORMALIZE CHARACTER IMAGES
+# =====================================================
+
+def normalize_character_image(image):
+
+    image = image.convert("RGB")
+
+    image_array = np.array(image)
+
+    # Detect the actual character and remove excessive
+    # white margins around the generated image.
+
+    mask = np.any(
+        image_array < 245,
+        axis=2
+    )
+
+    coordinates = np.where(mask)
+
+    if len(coordinates[0]) > 0:
+
+        left = max(
+            0,
+            int(np.min(coordinates[1])) - 12
+        )
+
+        top = max(
+            0,
+            int(np.min(coordinates[0])) - 12
+        )
+
+        right = min(
+            image.width,
+            int(np.max(coordinates[1])) + 13
+        )
+
+        bottom = min(
+            image.height,
+            int(np.max(coordinates[0])) + 13
+        )
+
+        image = image.crop(
+            (left, top, right, bottom)
+        )
+
+    # Keep every pose inside the same canvas.
+
+    image = ImageOps.contain(
+        image,
+        (
+            AVATAR_WIDTH - 30,
+            AVATAR_HEIGHT - 30
+        ),
+        Image.Resampling.LANCZOS
+    )
+
+    canvas = Image.new(
+        "RGB",
+        (
+            AVATAR_WIDTH,
+            AVATAR_HEIGHT
+        ),
+        (255, 255, 255)
+    )
+
+    x = (
+        AVATAR_WIDTH - image.width
+    ) // 2
+
+    y = (
+        AVATAR_HEIGHT - image.height
+    )
+
+    canvas.paste(
+        image,
+        (x, y)
+    )
+
+    return canvas
+
+
+# =====================================================
 # LOAD CHARACTER IMAGES
 # =====================================================
 
 def load_character_images():
 
-    logging.info("Loading character images...")
+    logging.info(
+        "Loading character images..."
+    )
 
     characters = {}
 
@@ -79,60 +243,26 @@ def load_character_images():
 
         image = Image.open(
             image_path
-        ).convert("RGB")
+        )
 
-        image = ImageOps.contain(
-            image,
-            (AVATAR_WIDTH, AVATAR_HEIGHT),
-            Image.Resampling.LANCZOS
+        image = normalize_character_image(
+            image
         )
 
         characters[pose] = image
 
         logging.info(
-            f"Loaded character: {pose}"
+            f"Loaded normalized character: {pose}"
         )
 
     logging.info(
-        "All four character images loaded successfully."
+        "All character images loaded successfully."
     )
 
     return characters
 
 
 CHARACTERS = load_character_images()
-
-
-# =====================================================
-# LOAD HINDI FONTS
-# =====================================================
-
-def load_hindi_font(size):
-
-    font_paths = [
-        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Regular.ttf"
-    ]
-
-    for path in font_paths:
-
-        if os.path.exists(path):
-
-            return ImageFont.truetype(
-                path,
-                size
-            )
-
-    logging.warning(
-        "Hindi font not found. Using default font."
-    )
-
-    return ImageFont.load_default()
-
-
-TITLE_FONT = load_hindi_font(48)
-SCRIPT_FONT = load_hindi_font(46)
-SMALL_FONT = load_hindi_font(25)
 
 
 # =====================================================
@@ -183,7 +313,7 @@ def convert_audio_to_wav(
 
 
 # =====================================================
-# ANALYSE AUDIO USING FFMPEG
+# ANALYSE AUDIO
 # =====================================================
 
 def analyze_audio(audio_path):
@@ -253,17 +383,15 @@ def analyze_audio(audio_path):
 
         return np.zeros(1), 0.003
 
-    # Smooth audio volume to avoid rapid switching.
+    # Smooth volume fluctuations.
 
-    smoothing_window = np.ones(5) / 5
+    smoothing_window = np.ones(7) / 7
 
     rms_values = np.convolve(
         rms_values,
         smoothing_window,
         mode="same"
     )
-
-    # Calculate adaptive silence threshold.
 
     noise_level = np.percentile(
         rms_values,
@@ -285,6 +413,32 @@ def analyze_audio(audio_path):
     )
 
     return rms_values, threshold
+
+
+# =====================================================
+# SMOOTH AUDIO VOLUME
+# =====================================================
+
+def smooth_audio_volume(rms_values):
+
+    window_size = max(
+        1,
+        int(
+            VOLUME_SMOOTHING_SECONDS /
+            AUDIO_CHUNK_SECONDS
+        )
+    )
+
+    window = np.ones(
+        window_size,
+        dtype=np.float32
+    ) / window_size
+
+    return np.convolve(
+        rms_values,
+        window,
+        mode="same"
+    )
 
 
 # =====================================================
@@ -373,6 +527,9 @@ def get_current_word(
     timings
 ):
 
+    if not timings:
+        return 0
+
     for index, item in enumerate(timings):
 
         if (
@@ -383,7 +540,7 @@ def get_current_word(
 
             return index
 
-    if timings and current_time >= timings[-1]["end"]:
+    if current_time >= timings[-1]["end"]:
 
         return len(timings) - 1
 
@@ -391,39 +548,124 @@ def get_current_word(
 
 
 # =====================================================
-# CHARACTER ANIMATION LOGIC
+# BUILD STABLE CHARACTER ANIMATION TIMELINE
 # =====================================================
 
-def select_character_pose(
-    current_time,
-    volume,
-    threshold
+def build_pose_timeline(
+    rms_values,
+    threshold,
+    duration
 ):
 
-    # Silence detection
+    logging.info(
+        "Building smooth character animation timeline..."
+    )
 
-    if volume < threshold:
+    smoothed_values = smooth_audio_volume(
+        rms_values
+    )
 
-        return "neutral"
+    interval = POSE_ANALYSIS_INTERVAL
 
-    # Occasional hand gesture during speaking.
-    # This is a timed visual effect, not semantic detection.
+    timeline = []
 
-    gesture_position = current_time % 16
+    current_pose = "neutral"
 
-    if 8.0 <= gesture_position < 8.8:
+    pose_start_time = 0.0
 
-        return "gesture"
+    time_points = np.arange(
+        0,
+        duration,
+        interval
+    )
 
-    # Stronger audio volume = wider mouth.
+    for current_time in time_points:
 
-    if volume > threshold * 2.2:
+        volume = get_audio_volume(
+            current_time,
+            smoothed_values
+        )
 
-        return "mouth_wide"
+        desired_pose = current_pose
 
-    # Normal speech.
+        if volume < threshold:
 
-    return "mouth_slight"
+            desired_pose = "neutral"
+
+        elif volume > threshold * WIDE_MOUTH_MULTIPLIER:
+
+            desired_pose = "mouth_wide"
+
+        else:
+
+            desired_pose = "mouth_slight"
+
+        # Prevent rapid switching.
+
+        pose_duration = (
+            current_time - pose_start_time
+        )
+
+        if (
+            desired_pose != current_pose
+            and pose_duration >= MIN_POSE_DURATION
+        ):
+
+            current_pose = desired_pose
+
+            pose_start_time = current_time
+
+        # Occasional explanation gesture.
+
+        gesture_position = (
+            current_time % GESTURE_INTERVAL
+        )
+
+        if (
+            volume >= threshold
+            and 8.0 <= gesture_position
+            < 8.0 + GESTURE_DURATION
+        ):
+
+            timeline.append(
+                "gesture"
+            )
+
+        else:
+
+            timeline.append(
+                current_pose
+            )
+
+    logging.info(
+        "Character animation timeline created."
+    )
+
+    return timeline
+
+
+# =====================================================
+# GET CHARACTER POSE FROM TIMELINE
+# =====================================================
+
+def get_character_pose(
+    current_time,
+    pose_timeline
+):
+
+    index = int(
+        current_time / POSE_ANALYSIS_INTERVAL
+    )
+
+    index = max(
+        0,
+        min(
+            index,
+            len(pose_timeline) - 1
+        )
+    )
+
+    return pose_timeline[index]
 
 
 # =====================================================
@@ -443,7 +685,7 @@ def render_lyrics_panel(
 
     draw = ImageDraw.Draw(panel)
 
-    # Panel background
+    # Main panel.
 
     draw.rounded_rectangle(
         (5, 5, 1075, 815),
@@ -453,7 +695,7 @@ def render_lyrics_panel(
         width=3
     )
 
-    # Heading
+    # Heading.
 
     draw.text(
         (45, 35),
@@ -470,7 +712,7 @@ def render_lyrics_panel(
 
     words = script.split()
 
-    # Display a moving window of words.
+    # Stable subtitle window.
 
     window_size = 18
 
@@ -513,8 +755,6 @@ def render_lyrics_panel(
             font=SCRIPT_FONT
         )
 
-        # Move to next line if required.
-
         if (
             x > 45
             and x + word_width > 45 + max_width
@@ -523,7 +763,7 @@ def render_lyrics_panel(
             x = 45
             y += line_height
 
-        # Highlight current word.
+        # Current word highlight.
 
         if actual_index == current_word_index:
 
@@ -542,11 +782,11 @@ def render_lyrics_panel(
 
         elif actual_index < current_word_index:
 
-            text_color = (75, 75, 75)
+            text_color = (65, 65, 65)
 
         else:
 
-            text_color = (155, 155, 155)
+            text_color = (135, 135, 135)
 
         draw.text(
             (x, y),
@@ -570,8 +810,7 @@ def render_lyrics_panel(
 def create_video_frame(
     current_time,
     timings,
-    rms_values,
-    threshold,
+    pose_timeline,
     script,
     panel_cache
 ):
@@ -584,26 +823,18 @@ def create_video_frame(
 
     draw = ImageDraw.Draw(frame)
 
-    # Get current audio volume.
-
-    volume = get_audio_volume(
-        current_time,
-        rms_values
-    )
-
-    # Find current word.
+    # Current word.
 
     current_index = get_current_word(
         current_time,
         timings
     )
 
-    # Select character pose.
+    # Stable character pose.
 
-    pose = select_character_pose(
+    pose = get_character_pose(
         current_time,
-        volume,
-        threshold
+        pose_timeline
     )
 
     character = CHARACTERS[pose]
@@ -618,16 +849,16 @@ def create_video_frame(
         (character_x, character_y)
     )
 
-    # Character branding.
+    # Branding.
 
     draw.text(
         (80, 1010),
         "THE PTG GUY",
-        font=SMALL_FONT,
+        font=BRANDING_FONT,
         fill=(75, 75, 75)
     )
 
-    # Cache lyrics panel by current word.
+    # Cache text panels.
 
     if current_index not in panel_cache:
 
@@ -637,8 +868,6 @@ def create_video_frame(
         )
 
     panel = panel_cache[current_index]
-
-    # Display lyrics panel.
 
     frame.paste(
         panel,
@@ -650,7 +879,7 @@ def create_video_frame(
     draw.text(
         (800, 1000),
         "Punjabi Lyrics Explained in Hindi",
-        font=SMALL_FONT,
+        font=BRANDING_FONT,
         fill=(110, 110, 110)
     )
 
@@ -722,7 +951,7 @@ def generate_video(
             wav_path
         )
 
-        # Analyse WAV.
+        # Analyse audio.
 
         rms_values, threshold = analyze_audio(
             wav_path
@@ -733,8 +962,6 @@ def generate_video(
         final_video = None
 
         try:
-
-            # Open WAV using MoviePy.
 
             audio_clip = AudioFileClip(
                 wav_path
@@ -752,14 +979,22 @@ def generate_video(
                     "Audio duration is invalid."
                 )
 
-            # Calculate estimated word timings.
+            # Word timings.
 
             timings = calculate_word_timings(
                 script,
                 duration
             )
 
-            # Cache rendered text panels.
+            # Character animation timeline.
+
+            pose_timeline = build_pose_timeline(
+                rms_values,
+                threshold,
+                duration
+            )
+
+            # Cache subtitle panels.
 
             panel_cache = {}
 
@@ -770,8 +1005,7 @@ def generate_video(
                 return create_video_frame(
                     current_time=t,
                     timings=timings,
-                    rms_values=rms_values,
-                    threshold=threshold,
+                    pose_timeline=pose_timeline,
                     script=script,
                     panel_cache=panel_cache
                 )
@@ -809,8 +1043,6 @@ def generate_video(
             )
 
         finally:
-
-            # Close clips before temporary files are removed.
 
             if final_video is not None:
                 final_video.close()
