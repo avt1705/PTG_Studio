@@ -8,9 +8,7 @@ import shutil
 import tempfile
 import traceback
 import subprocess
-import wave
 
-import requests
 import numpy as np
 import runpod
 
@@ -27,14 +25,6 @@ HEIGHT = 1080
 FPS = 30
 
 ASSET_DIR = "/app"
-
-SARVAM_URL = "https://api.sarvam.ai/text-to-speech"
-
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-
-SARVAM_SPEAKER = "shubh"
-SARVAM_LANGUAGE = "hi-IN"
-SARVAM_MODEL = "bulbul:v3"
 
 CHARACTER_FILES = {
     "neutral": "01_neutral.png",
@@ -103,83 +93,6 @@ def get_english_font(size):
     return ImageFont.truetype(
         ENGLISH_FONT_PATH,
         size
-    )
-
-
-# =====================================================
-# SARVAM VOICE GENERATION
-# =====================================================
-
-def generate_sarvam_audio(script, audio_path):
-
-    if not SARVAM_API_KEY:
-
-        raise RuntimeError(
-            "SARVAM_API_KEY environment variable is missing."
-        )
-
-    print("Starting Sarvam voice generation...", flush=True)
-
-    headers = {
-        "api-subscription-key": SARVAM_API_KEY,
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "inputs": [script],
-        "target_language_code": SARVAM_LANGUAGE,
-        "speaker": SARVAM_SPEAKER,
-        "model": SARVAM_MODEL,
-        "output_audio_codec": "wav"
-    }
-
-    response = requests.post(
-        SARVAM_URL,
-        headers=headers,
-        json=payload,
-        timeout=240
-    )
-
-    if response.status_code != 200:
-
-        raise RuntimeError(
-            f"Sarvam API Error {response.status_code}: "
-            f"{response.text}"
-        )
-
-    result = response.json()
-
-    audios = result.get("audios", [])
-
-    if not audios:
-
-        raise RuntimeError(
-            f"Sarvam returned no audio: {result}"
-        )
-
-    audio_bytes = base64.b64decode(
-        audios[0]
-    )
-
-    with open(audio_path, "wb") as file:
-
-        file.write(audio_bytes)
-
-    if not os.path.exists(audio_path):
-
-        raise RuntimeError(
-            "Unable to save Sarvam audio."
-        )
-
-    if os.path.getsize(audio_path) < 100:
-
-        raise RuntimeError(
-            "Generated audio file is unexpectedly small."
-        )
-
-    print(
-        f"Sarvam audio generated: {os.path.getsize(audio_path)} bytes",
-        flush=True
     )
 
 
@@ -406,8 +319,6 @@ def get_character_pose(t, timeline):
     )
 
     pose = timeline[index]
-
-    # Occasional explanation gesture.
 
     gesture_position = t % 22.0
 
@@ -723,7 +634,7 @@ def create_frame(
 # GENERATE COMPLETE VIDEO
 # =====================================================
 
-def generate_video(script):
+def generate_video(script, audio_base64):
 
     temp_dir = tempfile.mkdtemp(
         prefix="ptg_"
@@ -744,16 +655,39 @@ def generate_video(script):
 
     try:
 
-        # STEP 1: GENERATE VOICE
+        # STEP 1: RECEIVE AUDIO FROM FRONTEND
 
         print(
-            "STEP 1: Generating Sarvam voice...",
+            "STEP 1: Receiving Sarvam audio from frontend...",
             flush=True
         )
 
-        generate_sarvam_audio(
-            script,
-            audio_path
+        try:
+            audio_bytes = base64.b64decode(
+                audio_base64,
+                validate=True
+            )
+        except Exception as error:
+            raise ValueError(
+                f"Invalid base64 audio received: {error}"
+            )
+
+        if not audio_bytes:
+
+            raise RuntimeError(
+                "Received empty audio from frontend."
+            )
+
+        with open(
+            audio_path,
+            "wb"
+        ) as file:
+
+            file.write(audio_bytes)
+
+        print(
+            f"Audio received: {len(audio_bytes)} bytes",
+            flush=True
         )
 
         # STEP 2: LOAD AUDIO
@@ -842,7 +776,7 @@ def generate_video(script):
             duration=duration
         )
 
-        # ATTACH THE SAME SARVAM AUDIO
+        # ATTACH THE SAME FRONTEND AUDIO
 
         video_clip = video_clip.set_audio(
             audio_clip
@@ -905,11 +839,9 @@ def generate_video(script):
     finally:
 
         if video_clip is not None:
-
             video_clip.close()
 
         if audio_clip is not None:
-
             audio_clip.close()
 
         gc.collect()
@@ -943,16 +875,27 @@ def handler(event):
             ""
         ).strip()
 
+        audio_base64 = input_data.get(
+            "audio_base64",
+            ""
+        )
+
         if not script:
 
             raise ValueError(
                 "Hindi script is missing."
             )
 
+        if not audio_base64:
+
+            raise ValueError(
+                "Audio is missing from frontend request."
+            )
+
         if len(script) > 2500:
 
             raise ValueError(
-                "Script exceeds Sarvam Bulbul v3's 2500-character limit."
+                "Script exceeds 2500 characters."
             )
 
         print(
@@ -961,7 +904,8 @@ def handler(event):
         )
 
         result = generate_video(
-            script
+            script,
+            audio_base64
         )
 
         return result
