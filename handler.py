@@ -1,4 +1,3 @@
-```python
 import os
 import re
 import gc
@@ -994,4 +993,3 @@ print(
 runpod.serverless.start({
     "handler": handler
 })
-```
