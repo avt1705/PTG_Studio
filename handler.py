@@ -14,10 +14,15 @@ import runpod
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import VideoClip, AudioFileClip
 
+
+# =====================================================
 # CONFIGURATION
+# =====================================================
+
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 30
+
 ASSET_DIR = "/app"
 
 CHARACTER_FILES = {
@@ -29,19 +34,29 @@ CHARACTER_FILES = {
 
 CHARACTER_WIDTH = 760
 CHARACTER_HEIGHT = 900
+CHARACTER_X = 15
+CHARACTER_Y = 90
+
 ANIMATION_INTERVAL = 0.10
 MIN_POSE_DURATION = 0.65
 
-PANEL_X = 850
-PANEL_Y = 250
-PANEL_WIDTH = 990
-MAX_VISIBLE_CHUNKS = 4
+# Old subtitle panel layout
+PANEL_X = 780
+PANEL_WIDTH = WIDTH - PANEL_X
+MAX_VISIBLE_SENTENCES = 4
 
+SAMPLE_RATE = 8000
+
+
+# =====================================================
 # FONT LOADING
+# =====================================================
+
 def find_hindi_font():
     candidates = [
         "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Regular.ttf"
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Regular.ttf"
     ]
 
     for path in candidates:
@@ -57,7 +72,11 @@ def find_hindi_font():
         if os.path.isfile(path):
             return path
 
-    raise FileNotFoundError("Hindi Devanagari font not found.")
+    raise FileNotFoundError(
+        "Hindi Devanagari font not found. "
+        "Please ensure Noto Sans Devanagari is installed in the Docker image."
+    )
+
 
 def find_english_font():
     candidates = [
@@ -81,24 +100,33 @@ def find_english_font():
 
     raise FileNotFoundError("English font not found.")
 
+
 HINDI_FONT_PATH = find_hindi_font()
 ENGLISH_FONT_PATH = find_english_font()
+
 
 def get_font(size):
     return ImageFont.truetype(HINDI_FONT_PATH, size)
 
+
 def get_english_font(size):
     return ImageFont.truetype(ENGLISH_FONT_PATH, size)
 
+
+# =====================================================
 # LOAD CHARACTER IMAGES
+# =====================================================
+
 def load_character_images():
     images = {}
 
     for pose, filename in CHARACTER_FILES.items():
         path = os.path.join(ASSET_DIR, filename)
 
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Missing character image: {path}")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Missing character image: {path}"
+            )
 
         image = Image.open(path).convert("RGBA")
         image.thumbnail(
@@ -110,15 +138,21 @@ def load_character_images():
     print("All four character images loaded.", flush=True)
     return images
 
+
+# =====================================================
 # AUDIO ANALYSIS
+# =====================================================
+
 def analyse_audio(audio_path):
     raw_path = audio_path + ".raw"
 
     command = [
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-i", audio_path,
+        "-vn",
         "-ac", "1",
-        "-ar", "8000",
+        "-ar", str(SAMPLE_RATE),
         "-f", "f32le",
         raw_path
     ]
@@ -138,14 +172,20 @@ def analyse_audio(audio_path):
             )[-2000:]
         )
 
-    samples = np.fromfile(raw_path, dtype=np.float32)
-    os.remove(raw_path)
+    try:
+        samples = np.fromfile(raw_path, dtype=np.float32)
+    finally:
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
 
     if len(samples) == 0:
         raise RuntimeError("Audio analysis returned empty data.")
 
-    sample_rate = 8000
-    window_size = int(sample_rate * ANIMATION_INTERVAL)
+    window_size = max(
+        1,
+        int(SAMPLE_RATE * ANIMATION_INTERVAL)
+    )
+
     rms_values = []
 
     for start in range(0, len(samples), window_size):
@@ -157,25 +197,28 @@ def analyse_audio(audio_path):
         rms = np.sqrt(np.mean(chunk ** 2))
         rms_values.append(rms)
 
-    rms_values = np.array(rms_values, dtype=np.float32)
+    rms_values = np.asarray(rms_values, dtype=np.float32)
 
     if len(rms_values) >= 3:
-        kernel = np.ones(3) / 3
         rms_values = np.convolve(
             rms_values,
-            kernel,
+            np.ones(3, dtype=np.float32) / 3,
             mode="same"
         )
 
     return rms_values
 
+
+# =====================================================
 # CHARACTER ANIMATION TIMELINE
+# =====================================================
+
 def create_animation_timeline(rms_values):
     if len(rms_values) == 0:
         return ["neutral"]
 
-    noise = np.percentile(rms_values, 25)
-    speech = np.percentile(rms_values, 80)
+    noise = float(np.percentile(rms_values, 25))
+    speech = float(np.percentile(rms_values, 80))
 
     threshold = max(
         noise * 1.8,
@@ -222,178 +265,246 @@ def create_animation_timeline(rms_values):
 
     return timeline
 
+
 def get_character_pose(t, timeline):
+    if not timeline:
+        return "neutral"
+
     index = int(t / ANIMATION_INTERVAL)
-    index = min(index, len(timeline) - 1)
+    index = max(0, min(index, len(timeline) - 1))
 
     pose = timeline[index]
+
+    # Preserve the occasional gesture animation.
     gesture_position = t % 22.0
 
-    if (
-        pose != "neutral"
-        and 8.0 <= gesture_position <= 9.0
-    ):
+    if pose != "neutral" and 8.0 <= gesture_position <= 9.0:
         return "gesture"
 
     return pose
 
-# CREATE SUBTITLE CHUNKS
-def create_subtitle_chunks(script):
+
+# =====================================================
+# OLD SUBTITLE LOGIC: SENTENCE SPLITTING AND TIMING
+# =====================================================
+
+def split_script(script):
+    lines = [
+        line.strip()
+        for line in script.splitlines()
+        if line.strip()
+    ]
+
+    if len(lines) > 1:
+        return lines
+
     sentences = re.split(
-        r'(?<=[।!?])\s+|(?<=[.!?])\s+',
+        r'(?<=[।.!?])\s+',
         script.strip()
     )
 
-    chunks = []
-    max_words = 7
-
-    for sentence in sentences:
-        words = sentence.strip().split()
-
-        if not words:
-            continue
-
-        for index in range(0, len(words), max_words):
-            chunk = " ".join(words[index:index + max_words])
-
-            if chunk:
-                chunks.append(chunk)
-
-    return chunks
-
-# SUBTITLE TIMING
-def create_subtitle_timeline(chunks, duration):
-    if not chunks:
-        return []
-
-    weights = [
-        max(len(chunk.split()), 1)
-        for chunk in chunks
+    sentences = [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip()
     ]
 
-    total_weight = sum(weights)
-    timeline = []
+    return sentences if sentences else [script.strip()]
+
+
+def calculate_sentence_timings(sentences, duration):
+    if not sentences:
+        return []
+
+    total_chars = sum(
+        len(sentence)
+        for sentence in sentences
+    )
+
+    timings = []
     current_time = 0.0
 
-    for chunk, weight in zip(chunks, weights):
-        chunk_duration = duration * weight / total_weight
+    for sentence in sentences:
+        if total_chars:
+            sentence_duration = (
+                len(sentence) / total_chars
+            ) * duration
+        else:
+            sentence_duration = duration / len(sentences)
 
-        timeline.append({
-            "text": chunk,
+        timings.append({
+            "text": sentence,
             "start": current_time,
-            "end": current_time + chunk_duration
+            "end": current_time + sentence_duration
         })
 
-        current_time += chunk_duration
+        current_time += sentence_duration
 
-    return timeline
+    # Ensure the final sentence remains visible through the end.
+    timings[-1]["end"] = duration
 
-# TEXT WRAPPING
+    return timings
+
+
+# =====================================================
+# SUBTITLE TEXT WRAPPING
+# =====================================================
+
 def wrap_text(draw, text, font, max_width):
     words = text.split()
     lines = []
-    current = ""
+    current_line = ""
 
     for word in words:
-        test = (current + " " + word).strip()
+        test_line = (
+            current_line + " " + word
+        ).strip()
 
-        width = draw.textbbox(
+        box = draw.textbbox(
             (0, 0),
-            test,
+            test_line,
             font=font
-        )[2]
+        )
 
-        if width <= max_width:
-            current = test
+        text_width = box[2] - box[0]
+
+        if text_width <= max_width:
+            current_line = test_line
         else:
-            if current:
-                lines.append(current)
-            current = word
+            if current_line:
+                lines.append(current_line)
 
-    if current:
-        lines.append(current)
+            current_line = word
+
+    if current_line:
+        lines.append(current_line)
 
     return lines
 
-# DRAW SUBTITLES
-def draw_subtitles(canvas, draw, t, subtitle_timeline):
-    current_index = -1
 
-    for index, item in enumerate(subtitle_timeline):
-        if t >= item["start"]:
+# =====================================================
+# OLD SUBTITLE DESIGN DRAWN ON THE NEW VIDEO FRAME
+# =====================================================
+
+def draw_subtitles(canvas, draw, t, timings):
+    # Old light-grey split-screen panel.
+    draw.rectangle(
+        (PANEL_X, 0, WIDTH, HEIGHT),
+        fill=(250, 250, 250)
+    )
+
+    # Old panel heading.
+    draw.text(
+        (PANEL_X + 65, 75),
+        "गीत का मतलब",
+        font=get_font(55),
+        fill=(25, 25, 25)
+    )
+
+    draw.rounded_rectangle(
+        (
+            PANEL_X + 65,
+            155,
+            WIDTH - 65,
+            160
+        ),
+        radius=3,
+        fill=(220, 220, 220)
+    )
+
+    if not timings:
+        return
+
+    current_index = 0
+
+    for index, item in enumerate(timings):
+        if item["start"] <= t < item["end"]:
             current_index = index
-        else:
             break
 
-    if current_index < 0:
-        return
+        if t >= item["end"]:
+            current_index = index
 
     start_index = max(
         0,
-        current_index - MAX_VISIBLE_CHUNKS + 1
+        current_index - MAX_VISIBLE_SENTENCES + 1
     )
 
-    visible = subtitle_timeline[
+    visible = timings[
         start_index:current_index + 1
     ]
 
-    font = get_font(42)
-    line_height = 62
-    padding_x = 35
-    padding_y = 24
-    y = PANEL_Y
+    active_font = get_font(43)
+    previous_font = get_font(34)
 
-    for index, item in enumerate(visible):
-        actual_index = start_index + index
+    y = 220
+    card_left = PANEL_X + 65
+    card_right = WIDTH - 65
+    text_left = PANEL_X + 100
+    max_text_width = PANEL_WIDTH - 190
+
+    for local_index, item in enumerate(visible):
+        actual_index = start_index + local_index
         is_current = actual_index == current_index
 
-        lines = wrap_text(
+        if is_current:
+            box_fill = (255, 238, 190)
+            text_fill = (25, 25, 25)
+            text_font = active_font
+        else:
+            box_fill = (240, 240, 240)
+            text_fill = (125, 125, 125)
+            text_font = previous_font
+
+        wrapped = wrap_text(
             draw,
             item["text"],
-            font,
-            PANEL_WIDTH - padding_x * 2
+            text_font,
+            max_text_width
         )
 
-        lines = lines[:2]
-
-        card_height = (
-            padding_y * 2 +
-            len(lines) * line_height
+        # Keep unusually long sentences inside the panel.
+        available_height = HEIGHT - 70 - y
+        max_lines = max(
+            1,
+            min(4, int((available_height - 45) / 65))
         )
+        wrapped = wrapped[:max_lines]
 
-        if is_current:
-            background = (35, 35, 35)
-            text_color = (255, 204, 0)
-        else:
-            background = (245, 245, 245)
-            text_color = (145, 145, 145)
+        box_height = max(1, len(wrapped)) * 65 + 45
 
         draw.rounded_rectangle(
             (
-                PANEL_X,
+                card_left,
                 y,
-                PANEL_X + PANEL_WIDTH,
-                y + card_height
+                card_right,
+                y + box_height
             ),
-            radius=20,
-            fill=background
+            radius=22,
+            fill=box_fill
         )
 
-        text_y = y + padding_y
+        text_y = y + 20
 
-        for line in lines:
+        for line in wrapped:
             draw.text(
-                (PANEL_X + padding_x, text_y),
+                (text_left, text_y),
                 line,
-                font=font,
-                fill=text_color
+                font=text_font,
+                fill=text_fill
             )
+            text_y += 65
 
-            text_y += line_height
+        y += box_height + 25
 
-        y += card_height + 14
+        if y >= HEIGHT - 30:
+            break
 
+
+# =====================================================
 # CREATE VIDEO FRAME
+# =====================================================
+
 def create_frame(
     t,
     character_images,
@@ -408,20 +519,32 @@ def create_frame(
 
     draw = ImageDraw.Draw(canvas)
 
-    # CHARACTER
-    pose = get_character_pose(t, animation_timeline)
-    character = character_images[pose]
+    # Character on the left.
+    pose = get_character_pose(
+        t,
+        animation_timeline
+    )
 
-    character_x = 40
-    character_y = HEIGHT - character.height - 65
+    character = character_images.get(
+        pose,
+        character_images["neutral"]
+    )
+
+    character_y = max(
+        0,
+        min(
+            CHARACTER_Y,
+            HEIGHT - character.height
+        )
+    )
 
     canvas.paste(
         character,
-        (character_x, character_y),
+        (CHARACTER_X, character_y),
         character
     )
 
-    # SUBTITLES
+    # Old sentence-based subtitle panel on the right.
     draw_subtitles(
         canvas,
         draw,
@@ -429,28 +552,21 @@ def create_frame(
         subtitle_timeline
     )
 
-    # BRANDING
-    brand_font = get_english_font(28)
-
+    # Existing PTG branding.
     draw.text(
         (75, 1010),
         "THE PTG GUY",
-        font=brand_font,
+        font=get_english_font(28),
         fill=(90, 90, 90)
-    )
-
-    footer_font = get_font(27)
-
-    draw.text(
-        (900, 960),
-        "Punjabi Lyrics Explained in Hindi",
-        font=footer_font,
-        fill=(110, 110, 110)
     )
 
     return np.array(canvas)
 
+
+# =====================================================
 # GENERATE COMPLETE VIDEO
+# =====================================================
+
 def generate_video(script, audio_base64):
     temp_dir = tempfile.mkdtemp(prefix="ptg_")
 
@@ -468,11 +584,8 @@ def generate_video(script, audio_base64):
     video_clip = None
 
     try:
-        # STEP 1: RECEIVE AUDIO FROM FRONTEND
-        print(
-            "STEP 1: Receiving Sarvam audio from frontend...",
-            flush=True
-        )
+        # STEP 1: Decode audio received from frontend.
+        print("STEP 1: Receiving Sarvam audio...", flush=True)
 
         try:
             audio_bytes = base64.b64decode(
@@ -497,21 +610,21 @@ def generate_video(script, audio_base64):
             flush=True
         )
 
-        # STEP 2: LOAD AUDIO
+        # STEP 2: Load audio.
         print("STEP 2: Loading audio...", flush=True)
 
         audio_clip = AudioFileClip(audio_path)
-        duration = audio_clip.duration
+        duration = float(audio_clip.duration)
 
         if duration <= 0:
             raise RuntimeError("Invalid audio duration.")
 
-        # STEP 3: LOAD CHARACTER
+        # STEP 3: Load the four character poses.
         print("STEP 3: Loading character images...", flush=True)
 
         character_images = load_character_images()
 
-        # STEP 4: ANALYSE AUDIO
+        # STEP 4: Analyse audio for mouth animation.
         print("STEP 4: Analysing audio...", flush=True)
 
         rms_values = analyse_audio(audio_path)
@@ -520,17 +633,17 @@ def generate_video(script, audio_base64):
             rms_values
         )
 
-        # STEP 5: PREPARE SUBTITLES
-        print("STEP 5: Preparing subtitles...", flush=True)
+        # STEP 5: Prepare old sentence-based subtitles.
+        print("STEP 5: Preparing sentence subtitles...", flush=True)
 
-        chunks = create_subtitle_chunks(script)
+        sentences = split_script(script)
 
-        subtitle_timeline = create_subtitle_timeline(
-            chunks,
+        subtitle_timeline = calculate_sentence_timings(
+            sentences,
             duration
         )
 
-        # STEP 6: GENERATE VIDEO FRAMES
+        # STEP 6: Render video frames.
         print("STEP 6: Rendering video...", flush=True)
 
         def make_frame(t):
@@ -542,14 +655,13 @@ def generate_video(script, audio_base64):
             )
 
         video_clip = VideoClip(
-            make_frame,
+            make_frame=make_frame,
             duration=duration
         )
 
-        # ATTACH FRONTEND AUDIO
         video_clip = video_clip.set_audio(audio_clip)
 
-        # STEP 7: EXPORT FINAL MP4
+        # STEP 7: Export MP4.
         print("STEP 7: Exporting final MP4...", flush=True)
 
         video_clip.write_videofile(
@@ -569,8 +681,16 @@ def generate_video(script, audio_base64):
         audio_clip.close()
         audio_clip = None
 
-        # STEP 8: RETURN VIDEO
+        # STEP 8: Encode the final video.
         print("STEP 8: Encoding final video...", flush=True)
+
+        if not os.path.isfile(video_path):
+            raise RuntimeError("Video file was not created.")
+
+        file_size = os.path.getsize(video_path)
+
+        if file_size == 0:
+            raise RuntimeError("Generated video is empty.")
 
         with open(video_path, "rb") as file:
             video_base64 = base64.b64encode(
@@ -588,15 +708,26 @@ def generate_video(script, audio_base64):
             "resolution": "1920x1080",
             "fps": FPS,
             "voice": "Sarvam Bulbul v3 - Shubh",
-            "subtitle_chunks": len(chunks)
+            "subtitle_sentences": len(sentences),
+            "layout": "Animated Character + Old Sentence Subtitle Panel",
+            "file_size_mb": round(
+                file_size / (1024 * 1024),
+                2
+            )
         }
 
     finally:
         if video_clip is not None:
-            video_clip.close()
+            try:
+                video_clip.close()
+            except Exception:
+                pass
 
         if audio_clip is not None:
-            audio_clip.close()
+            try:
+                audio_clip.close()
+            except Exception:
+                pass
 
         gc.collect()
 
@@ -605,7 +736,11 @@ def generate_video(script, audio_base64):
             ignore_errors=True
         )
 
-# RUNPOD HANDLER
+
+# =====================================================
+# RUNPOD SERVERLESS HANDLER
+# =====================================================
+
 def handler(event):
     print(
         "PTG WORKER RECEIVED REQUEST.",
@@ -615,8 +750,15 @@ def handler(event):
     try:
         input_data = event.get("input", {})
 
-        script = input_data.get("script", "").strip()
-        audio_base64 = input_data.get("audio_base64", "")
+        script = input_data.get(
+            "script",
+            ""
+        ).strip()
+
+        audio_base64 = input_data.get(
+            "audio_base64",
+            ""
+        )
 
         if not script:
             raise ValueError("Hindi script is missing.")
@@ -636,12 +778,10 @@ def handler(event):
             flush=True
         )
 
-        result = generate_video(
+        return generate_video(
             script,
             audio_base64
         )
-
-        return result
 
     except Exception as error:
         print(
@@ -656,7 +796,11 @@ def handler(event):
             "error": str(error)
         }
 
+
+# =====================================================
 # START RUNPOD
+# =====================================================
+
 print("PTG WORKER STARTING...", flush=True)
 
 runpod.serverless.start({
